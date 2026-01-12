@@ -1,0 +1,19 @@
+services:
+  pi-node:
+    build: .
+    # or use: image: pinetwork/pi-node-docker:latest (if v23 tag exists)
+    container_name: pi-node-v23
+    ports:
+      - "11625:11625"   # stellar-core peer port
+      - "8000:8000"     # horizon API
+    volumes:
+      - pi-data:/opt/stellar
+      - pi-logs:/var/log
+    environment:
+      - NETWORK_PASSPHRASE=Pi Network Mainnet  # or correct Testnet value
+      - NODE_SEED=your_node_seed_here
+    restart: unless-stopped
+
+volumes:
+  pi-data:
+  pi-logs:
