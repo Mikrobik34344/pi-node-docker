@@ -7,17 +7,21 @@ export SUPHOME="$STELLAR_HOME/supervisor"
 export COREHOME="$STELLAR_HOME/core"
 export HZHOME="$STELLAR_HOME/horizon"
 
-export PGBIN="/usr/lib/postgresql/9.6/bin"
+export HISTHOME="$STELLAR_HOME/history"
+export LOCALHIST="$HISTHOME/local"
+
+export PGBIN="/usr/lib/postgresql/12/bin"
 export PGDATA="$PGHOME/data"
 export PGUSER="stellar"
 export PGPORT=5432
 
 QUICKSTART_INITIALIZED=false
 CURRENT_POSTGRES_PID=""
+ENABLE_AUTO_MIGRATIONS=false
 
 function main() {
 	echo ""
-	echo "Starting Stellar Quickstart"
+	echo "Starting Pi Node"
 	echo ""
 
 	process_args $*
@@ -31,7 +35,11 @@ function main() {
 	init_horizon
 	copy_pgpass
 
+	# run migrations if enabled (postgres is still running here)
+	run_migrations
+
 	stop_postgres  # this gets started in init_db
+	start_history_server
 
 	# launch services
 	exec_supervisor
@@ -44,22 +52,15 @@ function process_args() {
 
 
 	  case "${ARG}" in
-	  --testnet)
-	    NETWORK="testnet"
-	    ;;
-	  --pubnet)
+	  --mainnet)
 	    NETWORK="pubnet"
 	    ;;
-	  --standalone)
-	    NETWORK="standalone"
-	    ;;
-    --protocol-version)
-      export PROTOCOL_VERSION="$1"
-      shift
-      ;;
     --enable-asset-stats)
       export ENABLE_ASSET_STATS="$1"
       shift
+      ;;
+    --enable-auto-migrations)
+      ENABLE_AUTO_MIGRATIONS=true
       ;;
 	  *)
 	    echo "Unknown container arg $ARG" >&2
@@ -67,38 +68,24 @@ function process_args() {
 	  esac
 	done
 
-	# TODO: ask for what network to use
+	# Default to mainnet if no network specified
 	if [ -z "$NETWORK" ]; then
-		NETWORK="testnet"
+		NETWORK="pubnet"
 	fi
 
 	case "$NETWORK" in
-	testnet)
-    export NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-    export HISTORY_ARCHIVE_URLS="https://history.stellar.org/prd/core-testnet/core_testnet_001"
-    ;;
 	pubnet)
-    export NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
-    export HISTORY_ARCHIVE_URLS="https://history.stellar.org/prd/core-live/core_live_001"
-    ;;
-	standalone)
-    export NETWORK_PASSPHRASE="Standalone Network ; February 2017"
-    # h1570ry - we'll start a webserver connected to history directory later on
-    export HISTORY_ARCHIVE_URLS="http://localhost:1570"
+    export NETWORK_PASSPHRASE="Pi Network"
+    # Local history + CDN fallback for captive core
+    export HISTORY_ARCHIVE_URLS="http://localhost:1570,https://history.mainnet.minepi.com"
     ;;
 	*)
 		echo "Unknown network: '$NETWORK'" >&2
 		exit 1
 	esac
 
-	# Are we ephemeral or persistent?
-	if [ -z "$STELLAR_MODE" ]; then
-		if [ -f "/opt/stellar/.docker-ephemeral" ]; then
-			STELLAR_MODE="ephemeral"
-		else
-			STELLAR_MODE="persistent"
-		fi
-	fi
+	# Always run in persistent mode
+	STELLAR_MODE="persistent"
 }
 
 function set_pg_password() {
@@ -106,13 +93,6 @@ function set_pg_password() {
 	if [ -n "$POSTGRES_PASSWORD" ]; then
 		PGPASS=$POSTGRES_PASSWORD
 		echo "using POSTGRES_PASSWORD"
-		return 0
-	fi
-
-	# use a random password when ephemeral (or some other unknown mode)
-	if [ "$STELLAR_MODE" != "persistent" ]; then
-		PGPASS=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' |  head -c 16)
-		echo "postgres password: $PGPASS"
 		return 0
 	fi
 
@@ -165,6 +145,7 @@ function copy_defaults() {
 		echo "horizon: config directory exists, skipping copy"
 	else
 		$CP /opt/stellar-default/common/horizon/ $HZHOME
+		$CP /opt/stellar-default/$NETWORK/horizon/ $HZHOME
 	fi
 }
 
@@ -174,9 +155,9 @@ function copy_pgpass() {
 	$CP /opt/stellar/postgresql/.pgpass /root/
 	chmod 0600 /root/.pgpass
 
-	$CP /opt/stellar/postgresql/.pgpass /home/stellar
-	chmod 0600 /home/stellar/.pgpass
-	chown stellar:stellar /home/stellar/.pgpass
+	$CP /opt/stellar/postgresql/.pgpass /var/lib/stellar
+	chmod 0600 /var/lib/stellar/.pgpass
+	chown stellar:stellar /var/lib/stellar/.pgpass
 }
 
 function init_db() {
@@ -185,6 +166,16 @@ function init_db() {
 		return 0
 	fi
 	pushd $PGHOME
+
+	# Sometimes, the Postgres DB can end in a broken state where the data folder exists, yet the .quickstart-initialized file doesn't, which indicates that
+	# the init process failed somehow. In that case, it's preferable to clear the stellar volume and exit, so that the next time the container is run,
+	# the DB can be properly initialized again. This will result in data loss for the user, but the DB can be considered corrupted in that case anyway.
+	if [ -d "$PGDATA" ]
+	then
+		echo "invalid postgres state, clearing stellar volume"
+		rm -rf $STELLAR_HOME/*
+		exit 1
+	fi
 
 	# workaround!!!! from: https://github.com/nimiq/docker-postgresql93/issues/2
 	mkdir /etc/ssl/private-copy; mv /etc/ssl/private/* /etc/ssl/private-copy/; rm -r /etc/ssl/private; mv /etc/ssl/private-copy /etc/ssl/private; chmod -R 0700 /etc/ssl/private; chown -R postgres /etc/ssl/private
@@ -220,30 +211,33 @@ function init_stellar_core() {
 	run_silent "chown-core" chown -R stellar:stellar .
 	if [ -f $COREHOME/.quickstart-initialized ]; then
 		echo "core: already initialized"
-
-		if [ "$NETWORK" == "standalone" ]; then
-			start_postgres
-
-			run_silent "init-core-scp" sudo -u stellar stellar-core force-scp --conf $COREHOME/etc/stellar-core.cfg
-		fi
-
 		return 0
 	fi
 
-	run_silent "finalize-core-config" sed -ri "s/__PGPASS__/$PGPASS/g" etc/stellar-core.cfg
+	run_silent "finalize-core-config-pgpass" sed -ri "s/__PGPASS__/$PGPASS/g" etc/stellar-core.cfg
+
+	# Set this node's private key (secret_seed) if one is pass through an environment variable.
+	if [ -n "$NODE_PRIVATE_KEY" ]; then
+		run_silent "set-private-key" sed -ri "s/__NODE_PRIVATE_KEY__/$NODE_PRIVATE_KEY/g" $COREHOME/etc/stellar-core.cfg
+	else
+		GENERATED_PRIVATE_KEY=`stellar-core gen-seed | grep seed | awk '{print $3}'`
+		run_silent "set-private-key" sed -ri "s/__NODE_PRIVATE_KEY__/$GENERATED_PRIVATE_KEY/g" $COREHOME/etc/stellar-core.cfg
+	fi
 
 	start_postgres
 
 	run_silent "init-core-db" sudo -u stellar stellar-core new-db --conf etc/stellar-core.cfg
 
-	if [ "$NETWORK" == "standalone" ]; then
+	if [ "$NETWORK" == "pubnet" ]; then
 		run_silent "init-core-scp" sudo -u stellar stellar-core force-scp --conf etc/stellar-core.cfg
 
-		run_silent "init-history" sudo -u stellar stellar-core new-hist vs --conf $COREHOME/etc/stellar-core.cfg
-		# Start local history server
-		pushd /tmp/stellar-core/history/vs
-		python3 -m http.server 1570 > /dev/null 2>&1 &
+		mkdir -p "$HISTHOME"
+		pushd "$HISTHOME"
+		run_silent "chown-history" chown -R stellar:stellar .
 		popd
+
+		run_silent "init-history" sudo -u stellar stellar-core new-hist "local" --conf $COREHOME/etc/stellar-core.cfg
+		# Start local history server
 	fi
 
 	touch .quickstart-initialized
@@ -251,52 +245,59 @@ function init_stellar_core() {
 }
 
 function init_horizon() {
+	local ALREADY_INITIALIZED=false
 	if [ -f $HZHOME/.quickstart-initialized ]; then
 		echo "horizon: already initialized"
-		return 0
+		ALREADY_INITIALIZED=true
 	fi
+
 	pushd $HZHOME
 
-	run_silent "chown-horizon" chown stellar:stellar .
+	if [ "$ALREADY_INITIALIZED" = "false" ]; then
+		run_silent "chown-horizon" chown stellar:stellar .
 
-	sed -ri \
-		-e "s/__PGPASS__/$PGPASS/g" \
-		-e "s/__NETWORK__/$NETWORK_PASSPHRASE/g" \
-		-e "s=__ARCHIVE__=$HISTORY_ARCHIVE_URLS=g" \
-		etc/horizon.env
+		sed -ri \
+			-e "s/__PGPASS__/$PGPASS/g" \
+			-e "s/__NETWORK__/$NETWORK_PASSPHRASE/g" \
+			-e "s=__ARCHIVE__=$HISTORY_ARCHIVE_URLS=g" \
+			etc/horizon.env
 
-	start_postgres
-	run_silent "init-horizon-db" sudo -u stellar ./bin/horizon db init
+		start_postgres
+		run_silent "init-horizon-db" sudo -u stellar ./bin/horizon db init
 
-	touch .quickstart-initialized
+		touch .quickstart-initialized
+	fi
+
+	# Ensure captive-data directory exists with correct ownership (Horizon runs as stellar)
+	mkdir -p "$HZHOME/captive-data"
+	chown stellar:stellar "$HZHOME/captive-data"
+
+	# Verify APPLY_MIGRATIONS=true is present in horizon.env, add if missing
+	if ! grep -q "^export APPLY_MIGRATIONS=true" etc/horizon.env; then
+		echo "export APPLY_MIGRATIONS=true" >> etc/horizon.env
+	fi
+
 	popd
 }
 
-function upgrade_standalone() {
-	# Upgrade standalone network's protocol version
-	if [ "$NETWORK" = "standalone" ]; then
-		# Wait for server
-		while ! echo "Stellar-core http server listening!" | nc localhost 11626 &> /dev/null; do sleep 1; done
-		if [ -z "$PROTOCOL_VERSION" ]; then
-			# default to latest version supported by core
-			export PROTOCOL_VERSION=`curl -s http://localhost:11626/info | jq -r '.info.protocol_version'`
-		fi
-		if [ ".$PROTOCOL_VERSION" != ".none" ] ; then
-			if [ $PROTOCOL_VERSION -gt 0 ]; then
-				curl "http://localhost:11626/upgrades?mode=set&upgradetime=1970-01-01T00:00:00Z&protocolversion=$PROTOCOL_VERSION"
-			fi
-		fi
+function run_migrations() {
+	if [ "$ENABLE_AUTO_MIGRATIONS" != "true" ]; then
+		echo "migrations: auto-migrations disabled, skipping"
+		return 0
 	fi
+	# Ensure postgres is running before executing migrations
+	start_postgres
+
+	/migrations/migration_runner.sh
+	echo "migrations: completed"
 }
 
 function exec_supervisor() {
 	echo "starting supervisor"
-	upgrade_standalone &
 	exec supervisord -n -c $SUPHOME/etc/supervisord.conf
 }
 
-# run_silent is a utility function that runs a command with an abbreviated
-# output provided it succeeds.
+# run_silent is a utility function that runs a command with an abbreviated output provided it succeeds.
 function run_silent() {
 	local LABEL=$1
 	shift
@@ -327,6 +328,10 @@ function start_postgres() {
 		return 0
 	fi
 
+	# Clean up stale files from previous unclean shutdowns to prevent PID-collision race.
+	rm -f "$PGDATA/postmaster.pid"
+	rm -f /var/run/postgresql/.s.PGSQL.5432 /var/run/postgresql/.s.PGSQL.5432.lock
+
 	sudo -u postgres $PGBIN/postgres -D $PGDATA -c config_file=$PGHOME/etc/postgresql.conf &> /dev/null &
 	CURRENT_POSTGRES_PID=$!
 
@@ -336,6 +341,16 @@ function start_postgres() {
 	done
 
 	echo "postgres: up"
+}
+
+function start_history_server() {
+  if [ "$NETWORK" == "pubnet" ]; then
+    echo "Starting webfsd for local history..."
+    mkdir -p "$LOCALHIST"
+    pushd "$LOCALHIST"
+    webfsd -F -p 1570 > /dev/null 2>&1 &
+    popd
+  fi
 }
 
 function stop_postgres() {

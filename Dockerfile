@@ -1,14 +1,11 @@
-FROM stellar/base:latest
+FROM ubuntu:20.04
 
-MAINTAINER Bartek Nowotarski <bartek@stellar.org>
-
-ENV STELLAR_CORE_VERSION 13.1.0-1237-469b2e70
-ENV HORIZON_VERSION 1.4.0
+ENV STELLAR_CORE_VERSION 19.9.0-1254.064a2787a.focal
+ENV HORIZON_VERSION 2.30.0-436
 
 EXPOSE 5432
 EXPOSE 8000
-EXPOSE 11625
-EXPOSE 11626
+EXPOSE 31402
 
 ADD dependencies /
 RUN ["chmod", "+x", "dependencies"]
@@ -19,22 +16,23 @@ RUN ["chmod", "+x", "install"]
 RUN /install
 
 RUN ["mkdir", "-p", "/opt/stellar"]
-RUN ["touch", "/opt/stellar/.docker-ephemeral"]
-
-RUN useradd --uid 10011001 --home-dir /home/stellar --no-log-init stellar \
-    && mkdir -p /home/stellar \
-    && chown -R stellar:stellar /home/stellar
 
 RUN ["ln", "-s", "/opt/stellar", "/stellar"]
 RUN ["ln", "-s", "/opt/stellar/core/etc/stellar-core.cfg", "/stellar-core.cfg"]
 RUN ["ln", "-s", "/opt/stellar/horizon/etc/horizon.env", "/horizon.env"]
 ADD common /opt/stellar-default/common
 ADD pubnet /opt/stellar-default/pubnet
-ADD testnet /opt/stellar-default/testnet
-ADD standalone /opt/stellar-default/standalone
 
+ADD mirror_full_archive.sh /
+ADD horizon_complete_reingest.sh /
+
+RUN ["chmod", "+x", "/mirror_full_archive.sh"]
+RUN ["chmod", "+x", "/horizon_complete_reingest.sh"]
+
+ADD migrations /migrations
+RUN chmod +x /migrations/*.sh
 
 ADD start /
 RUN ["chmod", "+x", "start"]
 
-ENTRYPOINT ["/init", "--", "/start" ]
+ENTRYPOINT ["/start"]

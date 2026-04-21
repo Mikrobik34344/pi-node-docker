@@ -1,7 +1,4 @@
-__PHONY__: build build-testing
+__PHONY__: build
 
 build:
-	docker build -t stellar/quickstart -f Dockerfile .
-
-build-testing:
-	docker build -t stellar/quickstart:testing -f Dockerfile.testing .
+	docker build --platform linux/amd64 -t pinetwork/pi-node-docker:organization_mainnet-v1.0-p19.9 -f Dockerfile .
